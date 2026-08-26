@@ -49,6 +49,7 @@ class BoxDef:
     y: int
     w: int
     h: int
+    threshold: Optional[float] = None  # bu kutuya ozel esik (None ise genel esik kullanilir)
 
 
 @dataclass
@@ -146,21 +147,37 @@ def _rotate(img: np.ndarray, angle: int) -> np.ndarray:
     raise ValueError(angle)
 
 
-def _extract_patch(img: np.ndarray, box: BoxDef, margin: float = DEFAULT_MARGIN) -> np.ndarray:
+SEARCH_PAD = 6  # test yamalarinin her kenardan ne kadar genis kesilecegi (yerel kayma araligi)
+
+
+def _extract_patch(img: np.ndarray, box: BoxDef, margin: float = DEFAULT_MARGIN,
+                    pad: int = 0) -> np.ndarray:
     H, W = img.shape[:2]
     mx, my = int(box.w * margin), int(box.h * margin)  # kenarlardan icine dogru pay
-    x0 = max(0, box.x + mx)
-    y0 = max(0, box.y + my)
-    x1 = min(W, box.x + box.w - mx)
-    y1 = min(H, box.y + box.h - my)
-    if x1 <= x0 or y1 <= y0:  # pay cok buyukse kutuyu kucultmeden kullan
-        x0, y0, x1, y1 = box.x, box.y, box.x + box.w, box.y + box.h
-    patch = img[y0:y1, x0:x1]  # kutu bolgesini kes
+    x0c = box.x + mx
+    y0c = box.y + my
+    x1c = box.x + box.w - mx
+    y1c = box.y + box.h - my
+    if x1c <= x0c or y1c <= y0c:  # pay cok buyukse kutuyu kucultmeden kullan
+        x0c, y0c, x1c, y1c = box.x, box.y, box.x + box.w, box.y + box.h
+    bw, bh = x1c - x0c, y1c - y0c
+    # pad>0 ise, kutunun kendi olcegine oranli bir miktar fazladan kenar birak
+    # (bkz. _search_score: bu, kameranin/kutu yuksekliginin yol actigi kucuk
+    # yerel kaymalari aramak icin kullanilir)
+    padx = int(bw * pad / PATCH_SIZE) if pad else 0
+    pady = int(bh * pad / PATCH_SIZE) if pad else 0
+    x0, y0 = max(0, x0c - padx), max(0, y0c - pady)
+    x1, y1 = min(W, x1c + padx), min(H, y1c + pady)
+    patch = img[y0:y1, x0:x1]  # kutu bolgesini (gerekirse pay ile genisletilmis) kes
+    out_size = PATCH_SIZE + 2 * pad
     if patch.size == 0:
-        return np.zeros((PATCH_SIZE, PATCH_SIZE), np.uint8)
+        return np.zeros((out_size, out_size), np.uint8)
     gray = _gray(patch)
-    gray = cv2.equalizeHist(gray)  # aydınlatma/kontrast farklarına karşı normalize et
-    return cv2.resize(gray, (PATCH_SIZE, PATCH_SIZE), interpolation=cv2.INTER_AREA)  # herkes ayni boyutta olsun
+    # NOT: kontrast esitleme (equalizeHist/CLAHE) kasten uygulanmiyor. NCC zaten
+    # dogrusal parlaklik/kontrast farklarina karsi bagisik; gercek fotograflarla
+    # olculdugunde bu ek islemler (ozellikle duz/az detayli kutularda gurultuyu
+    # buyuterek) skorlari iyilestirmek yerine kotulestiriyordu.
+    return cv2.resize(gray, (out_size, out_size), interpolation=cv2.INTER_AREA)  # herkes ayni oranda olcekli
 
 
 def _ncc(a: np.ndarray, b: np.ndarray) -> float:
@@ -168,6 +185,16 @@ def _ncc(a: np.ndarray, b: np.ndarray) -> float:
     b = b.astype(np.float32)
     res = cv2.matchTemplate(a, b, cv2.TM_CCOEFF_NORMED)
     return float(res[0, 0])
+
+
+def _search_score(search_img: np.ndarray, template_img: np.ndarray) -> float:
+    # search_img, template_img'dan (SEARCH_PAD kadar) daha buyuktur; bu fonksiyon
+    # sablonu arama alani icinde kaydirarak en iyi eslesen konumun skorunu doner.
+    # Boylece kutu icerigi dogru olsa bile hizalamanin birkac piksel kaymasindan
+    # kaynaklanan yanlis "hatali kutu" sonuclari onlenir.
+    res = cv2.matchTemplate(search_img.astype(np.float32), template_img.astype(np.float32),
+                             cv2.TM_CCOEFF_NORMED)
+    return float(res.max())
 
 
 # --------------------------------------------------------------------------- #
@@ -204,16 +231,19 @@ def inspect(template: Template, test_bgr: np.ndarray, threshold: float = 0.55,
 
     boxes = template.boxes
     n = len(boxes)
-    ref_patches = [_extract_patch(template.ref_image, b, margin) for b in boxes]  # referanstaki 24 kutu
-    test_patches = {r: [_rotate(_extract_patch(warped, b, margin), r) for b in boxes] for r in ROTATIONS}  # test kutulari, her rotasyonda
+    ref_patches = [_extract_patch(template.ref_image, b, margin) for b in boxes]  # referanstaki 24 kutu (tam olcek)
+    # test kutulari referanstan biraz daha genis kesilir; boylece hizalamadaki
+    # kucuk yerel kaymalar (bkz. SEARCH_PAD) asagida aranarak telafi edilebilir
+    test_patches = {r: [_rotate(_extract_patch(warped, b, margin, pad=SEARCH_PAD), r) for b in boxes]
+                     for r in ROTATIONS}
 
-    # S[i, j, r] = test kutusu i'nin (r derece dondurulmus) referans kutusu j ile benzerligi
+    # S[i, j, r] = test kutusu i'nin (r derece dondurulmus) referans kutusu j ile en iyi yerel benzerligi
     S = np.zeros((n, n, len(ROTATIONS)), dtype=np.float32)
     for ri, r in enumerate(ROTATIONS):
         tp = test_patches[r]
         for i in range(n):
             for j in range(n):
-                S[i, j, ri] = _ncc(tp[i], ref_patches[j])
+                S[i, j, ri] = _search_score(tp[i], ref_patches[j])
 
     results: List[BoxResult] = []
     for i, b in enumerate(boxes):
@@ -228,13 +258,15 @@ def inspect(template: Template, test_bgr: np.ndarray, threshold: float = 0.55,
         j_star = int(j_star)
         r_star = ROTATIONS[int(r_star_idx)]
 
-        if own_best >= threshold and own_best_rot == 0:  # kendi yerinde, dogru yonde
+        box_threshold = b.threshold if b.threshold is not None else threshold  # kutuya ozel esik varsa onu kullan
+
+        if own_best >= box_threshold and own_best_rot == 0:  # kendi yerinde, dogru yonde
             results.append(BoxResult(b.id, "OK", own_best, "Doğru konum, doğru yön.", None, 0))
-        elif own_best >= threshold and own_best_rot != 0:  # kendi yerinde ama donuk
+        elif own_best >= box_threshold and own_best_rot != 0:  # kendi yerinde ama donuk
             results.append(BoxResult(
                 b.id, "ROTATED", own_best,
                 f"Doğru konumda ama {own_best_rot}° döndürülmüş.", None, own_best_rot))
-        elif j_star != i and global_best >= threshold:  # baska bir kutunun icerigi burada
+        elif j_star != i and global_best >= box_threshold:  # baska bir kutunun icerigi burada
             other_id = boxes[j_star].id
             results.append(BoxResult(
                 b.id, "SWAPPED", global_best,

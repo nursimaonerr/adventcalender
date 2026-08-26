@@ -104,6 +104,10 @@ def main():
                 redraw()
             elif key in (8, 127):  # backspace
                 number_buf = number_buf[:-1]
+            elif key in (ord('u'), ord('U')) and not number_buf:
+                # henuz rakam yazilmadiysa u, bekleyen (henuz onaylanmamis) kutuyu iptal eder
+                pending_box["rect"] = None
+                redraw()
             elif chr(key).isdigit():
                 number_buf += chr(key)
             continue
@@ -111,11 +115,11 @@ def main():
         if key == 27:  # ESC
             print("İptal edildi, kaydedilmedi.")
             break
-        elif key == ord('u'):
+        elif key in (ord('u'), ord('U')):
             if boxes:
                 boxes.pop()
                 redraw()
-        elif key == ord('s'):
+        elif key in (ord('s'), ord('S')):
             if len(boxes) == 0:
                 print("Hiç kutu işaretlenmedi.")
                 continue
